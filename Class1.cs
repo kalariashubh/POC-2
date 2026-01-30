@@ -27,10 +27,13 @@ namespace SvfDwgUnifiedBoundary
                 return;
             }
 
-            string jsonPath =
+            string clickPath =
                 @"D:\Buniyad Byte\POC 2\svf-dwg-dbId-boundary\server\storage\clicks.json";
 
-            if (!File.Exists(jsonPath))
+            string resultPath =
+                @"D:\Buniyad Byte\POC 2\svf-dwg-dbId-boundary\server\storage\clicks_result.json";
+
+            if (!File.Exists(clickPath))
             {
                 ed.WriteMessage("\n❌ clicks.json not found.");
                 return;
@@ -38,7 +41,7 @@ namespace SvfDwgUnifiedBoundary
 
             List<ClickData> clicks =
                 JsonConvert.DeserializeObject<List<ClickData>>(
-                    File.ReadAllText(jsonPath));
+                    File.ReadAllText(clickPath));
 
             if (clicks == null || clicks.Count == 0)
             {
@@ -46,17 +49,11 @@ namespace SvfDwgUnifiedBoundary
                 return;
             }
 
-            ClickData last = clicks[clicks.Count - 1];
-
-            if (string.IsNullOrWhiteSpace(last.externalId))
-            {
-                ed.WriteMessage("\n❌ externalId missing.");
-                return;
-            }
+            ClickData click = clicks[0];
 
             using (Transaction tr = db.TransactionManager.StartTransaction())
             {
-                long handleValue = Convert.ToInt64(last.externalId, 16);
+                long handleValue = Convert.ToInt64(click.externalId, 16);
                 ObjectId objId =
                     db.GetObjectId(false, new Handle(handleValue), 0);
 
@@ -71,17 +68,17 @@ namespace SvfDwgUnifiedBoundary
 
                 ed.WriteMessage("\n✔ Entity type: " + ent.GetType().Name);
 
-                List<Curve> boundaryCurves =
+                List<Curve> boundary =
                     ExtractBoundaryCurves(ent, tr);
 
-                if (boundaryCurves.Count == 0)
+                if (boundary.Count == 0)
                 {
-                    ed.WriteMessage("\n❌ No boundary curves extracted.");
+                    ed.WriteMessage("\n❌ No boundary found.");
                     return;
                 }
 
-                Extents3d ext = boundaryCurves[0].GeometricExtents;
-                foreach (Curve c in boundaryCurves)
+                Extents3d ext = boundary[0].GeometricExtents;
+                foreach (Curve c in boundary)
                     ext.AddExtents(c.GeometricExtents);
 
                 BlockTableRecord btr =
@@ -89,8 +86,14 @@ namespace SvfDwgUnifiedBoundary
                         db.CurrentSpaceId, OpenMode.ForWrite);
 
                 const double spacing = 100.0;
-                int barCount = 0;
+
+                int barIndex = 1;
                 double totalLength = 0;
+
+                List<BarResult> bars =
+                    new List<BarResult>();
+
+                ed.WriteMessage("\n---------------- BAR LENGTHS ----------------");
 
                 for (double y = ext.MinPoint.Y;
                      y <= ext.MaxPoint.Y;
@@ -101,63 +104,88 @@ namespace SvfDwgUnifiedBoundary
                             new Point3d(ext.MinPoint.X - 1000, y, 0),
                             new Point3d(ext.MaxPoint.X + 1000, y, 0));
 
-                    List<Point3d> intersections =
+                    List<Point3d> pts =
                         new List<Point3d>();
 
-                    foreach (Curve bc in boundaryCurves)
+                    foreach (Curve bc in boundary)
                     {
-                        Point3dCollection pts =
+                        Point3dCollection hits =
                             new Point3dCollection();
 
                         scanLine.IntersectWith(
                             bc,
                             Intersect.OnBothOperands,
-                            pts,
+                            hits,
                             IntPtr.Zero,
                             IntPtr.Zero);
 
-                        foreach (Point3d p in pts)
-                            intersections.Add(p);
+                        foreach (Point3d p in hits)
+                            pts.Add(p);
                     }
 
-                    intersections.Sort((a, b) => a.X.CompareTo(b.X));
+                    pts.Sort((a, b) => a.X.CompareTo(b.X));
 
-                    for (int i = 0; i + 1 < intersections.Count; i += 2)
+                    for (int i = 0; i + 1 < pts.Count; i += 2)
                     {
                         Line bar =
-                            new Line(
-                                intersections[i],
-                                intersections[i + 1]);
+                            new Line(pts[i], pts[i + 1]);
 
-                        totalLength += bar.Length;
-                        barCount++;
+                        double len = bar.Length;
+
+                        totalLength += len;
+
+                        bars.Add(
+                            new BarResult
+                            {
+                                index = barIndex,
+                                length = Math.Round(len, 2)
+                            });
+
+                        ed.WriteMessage(
+                            $"\nBar {barIndex} length : {len:F2}");
 
                         btr.AppendEntity(bar);
                         tr.AddNewlyCreatedDBObject(bar, true);
+
+                        barIndex++;
                     }
                 }
 
-                ed.WriteMessage("\n===============================");
-                ed.WriteMessage("\nBars created : " + barCount);
-                ed.WriteMessage("\nTotal length : " + totalLength.ToString("F2"));
-                ed.WriteMessage("\n===============================");
+                ed.WriteMessage("\n=================================");
+                ed.WriteMessage($"\nTotal Bars   : {barIndex - 1}");
+                ed.WriteMessage($"\nTotal Length : {totalLength:F2}");
+                ed.WriteMessage("\n=================================");
+
+                // ================= SAVE RESULT JSON =================
+                ResultJson result =
+                    new ResultJson
+                    {
+                        externalId = click.externalId,
+                        bars = bars,
+                        totalBars = barIndex - 1,
+                        totalLength = Math.Round(totalLength, 2),
+                        timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+                    };
+
+                File.WriteAllText(
+                    resultPath,
+                    JsonConvert.SerializeObject(result, Formatting.Indented));
+
+                ed.WriteMessage(
+                    $"\n✔ Result JSON saved: clicks_result.json");
 
                 tr.Commit();
             }
         }
 
-        // =====================================================
-        // FIXED BOUNDARY EXTRACTION
-        // =====================================================
+        // ================= BOUNDARY EXTRACTION =================
         private static List<Curve> ExtractBoundaryCurves(
             Entity ent,
             Transaction tr)
         {
             List<Curve> curves = new List<Curve>();
 
-            // ================= HATCH =================
-            Hatch hatch = ent as Hatch;
-            if (hatch != null)
+            if (ent is Hatch hatch)
             {
                 Plane plane =
                     new Plane(
@@ -172,43 +200,34 @@ namespace SvfDwgUnifiedBoundary
                     {
                         if (c2d is LineSegment2d ls)
                         {
-                            Point3d p1 =
-                                plane.EvaluatePoint(ls.StartPoint);
-                            Point3d p2 =
-                                plane.EvaluatePoint(ls.EndPoint);
-
-                            curves.Add(new Line(p1, p2));
+                            curves.Add(
+                                new Line(
+                                    plane.EvaluatePoint(ls.StartPoint),
+                                    plane.EvaluatePoint(ls.EndPoint)));
                         }
-                        else if (c2d is CircularArc2d arc2d)
+                        else if (c2d is CircularArc2d arc)
                         {
-                            Point3d center =
-                                plane.EvaluatePoint(arc2d.Center);
-
-                            Arc arc =
+                            curves.Add(
                                 new Arc(
-                                    center,
+                                    plane.EvaluatePoint(arc.Center),
                                     hatch.Normal,
-                                    arc2d.Radius,
-                                    arc2d.StartAngle,
-                                    arc2d.EndAngle);
-
-                            curves.Add(arc);
+                                    arc.Radius,
+                                    arc.StartAngle,
+                                    arc.EndAngle));
                         }
                     }
                 }
-
                 return curves;
             }
 
-            // ================= POLYLINE =================
             if (ent is Polyline pl)
             {
                 curves.Add(pl);
                 return curves;
             }
 
-            // ================= OTHERS =================
-            DBObjectCollection exploded = new DBObjectCollection();
+            DBObjectCollection exploded =
+                new DBObjectCollection();
             ent.Explode(exploded);
 
             foreach (DBObject obj in exploded)
@@ -221,13 +240,26 @@ namespace SvfDwgUnifiedBoundary
         }
     }
 
-    // =====================================================
-    // JSON MODEL
-    // =====================================================
+    // ================= JSON MODELS =================
     public class ClickData
     {
         public string externalId { get; set; }
         public int dbId { get; set; }
+        public long timestamp { get; set; }
+    }
+
+    public class BarResult
+    {
+        public int index { get; set; }
+        public double length { get; set; }
+    }
+
+    public class ResultJson
+    {
+        public string externalId { get; set; }
+        public List<BarResult> bars { get; set; }
+        public int totalBars { get; set; }
+        public double totalLength { get; set; }
         public long timestamp { get; set; }
     }
 }
